@@ -706,6 +706,33 @@ int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
 // the keycode was not mapped to a standard US English scancode and should be
 // interpreted as-is. This is a Sunshine protocol extension.
 #define SS_KBE_FLAG_NON_NORMALIZED 0x01
+
+// Disambiguates the Windows virtual key codes that Korean and Japanese IME keys
+// share. VK_HANGUL and VK_KANA are both 0x15, and VK_HANJA and VK_KANJI are both
+// 0x19, so the key code alone cannot identify which physical key was pressed.
+//
+// These flags carry the USB HID keyboard usage that the client observed:
+//   SS_KBE_FLAG_LANG1 - HID usage 0x90 (LANG1), the Hangul/English toggle key
+//   SS_KBE_FLAG_LANG2 - HID usage 0x91 (LANG2), the Hanja conversion key
+//
+// A client that sets SS_KBE_FLAG_LANG1 must send key code 0x15, and a client that
+// sets SS_KBE_FLAG_LANG2 must send key code 0x19. Both flags must never be set on
+// the same event; such an event is malformed and hosts are expected to drop it
+// rather than guess which key was intended.
+//
+// LANG flags require a matching host implementation. Behavior with hosts that do
+// not recognize these flags is unspecified: such a host sees key code 0x15 or 0x19
+// with SS_KBE_FLAG_NON_NORMALIZED set and may translate it through its active
+// keyboard layout, which has been observed to produce an Alt-family scan code
+// rather than the Hangul key. Clients and hosts must be version-matched.
+//
+// Intermediate layers must forward unknown flag bits unmodified; only the final
+// input backend interprets them.
+//
+// These are Sunshine protocol extensions.
+#define SS_KBE_FLAG_LANG1 0x02
+#define SS_KBE_FLAG_LANG2 0x04
+
 int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char flags);
 
 // This function queues an UTF-8 encoded text to be sent to the remote server.
