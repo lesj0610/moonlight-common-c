@@ -1079,8 +1079,10 @@ uint32_t LiGetHostFeatureFlags(void);
 // LI_STREAM_RESIZE_OK result, because frames of the new size may arrive before or after the result.
 //
 // This returns LI_ERR_UNSUPPORTED if the host doesn't support resizing or the stream isn't running,
-// -2 if the values are outside the LI_STREAM_RESIZE_* limits, and -1 if the request couldn't be sent.
-// It may be called from any thread.
+// -2 if the values are outside the LI_STREAM_RESIZE_* limits, and -1 if the request couldn't be
+// sent. After an error the host never sees the request, so nothing about the stream changes. A
+// request that was queued for sending counts as sent, because it is delivered once the network
+// recovers or the connection ends. It may be called from any thread.
 int LiRequestStreamResize(int width, int height, int fps, uint32_t* requestId);
 
 #ifdef __cplusplus

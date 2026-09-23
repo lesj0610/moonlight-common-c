@@ -702,11 +702,17 @@ static bool isPacketSentWaitingForAck(ENetPacket* packet) {
     return false;
 }
 
-static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+// If queued is not NULL, it says whether the packet made it into ENet's send queue, even when this
+// returns false. A reliable packet only leaves that queue by being delivered or by the peer going away.
+static bool sendMessageEnetQueued(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData, bool* queued) {
     ENetPacket* enetPacket;
     int err;
 
     LC_ASSERT(AppVersionQuad[0] >= 5);
+
+    if (queued != NULL) {
+        *queued = false;
+    }
 
     // Only send reliable packets to GFE
     if (!IS_SUNSHINE()) {
@@ -782,6 +788,9 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
     // Queue the packet to be sent
     err = enet_peer_send(peer, channelId, enetPacket);
     bool packetQueued = (err == 0);
+    if (queued != NULL) {
+        *queued = packetQueued;
+    }
 
     // If there is no more data coming soon, send the packet now
     if (!moreData && packetQueued) {
@@ -829,6 +838,10 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
     }
 
     return true;
+}
+
+static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+    return sendMessageEnetQueued(ptype, paylen, payload, channelId, flags, moreData, NULL);
 }
 
 static bool sendMessageTcp(short ptype, short paylen, const void* payload) {
@@ -2158,25 +2171,31 @@ int LiRequestStreamResize(int width, int height, int fps, uint32_t* requestId) {
         return LI_ERR_UNSUPPORTED;
     }
 
-    // The ID is used up even if sending fails, because the host may still see the request
     request.requestId = ++lastSentStreamResizeId;
     request.width = (uint16_t)width;
     request.height = (uint16_t)height;
     request.fps = (uint16_t)fps;
     ssStreamResizeWriteRequest(&request, payload);
 
-    if (sendMessageAndForget(SS_STREAM_RESIZE_REQUEST_PTYPE,
-                             sizeof(payload),
-                             payload,
-                             CTRL_CHANNEL_GENERIC,
-                             ENET_PACKET_FLAG_RELIABLE,
-                             false)) {
+    // A request that made it into ENet's queue counts as sent even if the network failed right
+    // after, because ENet delivers it once the network recovers or the connection ends. Only one
+    // that never got that far is reported as failed, so the client can rely on the host not
+    // acting on it.
+    bool queued;
+    if (sendMessageEnetQueued(SS_STREAM_RESIZE_REQUEST_PTYPE,
+                              sizeof(payload),
+                              payload,
+                              CTRL_CHANNEL_GENERIC,
+                              ENET_PACKET_FLAG_RELIABLE,
+                              false,
+                              &queued) || queued) {
         Limelog("Stream resize request %u sent: %dx%d at %d FPS\n", (unsigned int)request.requestId, width, height, fps);
         *requestId = request.requestId;
         err = 0;
     }
     else {
-        Limelog("Stream resize request %u failed: %d\n", (unsigned int)request.requestId, (int)LastSocketError());
+        Limelog("Stream resize request %u could not be sent: %d\n", (unsigned int)request.requestId, (int)LastSocketError());
+        lastSentStreamResizeId--;
         err = -1;
     }
 
