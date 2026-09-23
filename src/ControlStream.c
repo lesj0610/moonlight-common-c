@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "StreamResize.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -121,6 +122,13 @@ static PLT_EVENT idrFrameRequiredEvent;
 
 static PPLT_CRYPTO_CONTEXT encryptionCtx;
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
+
+// Stream resize requests (fork-only extension, see StreamResize.h). The mutex protects all three
+// values and is held while a request is sent, so request IDs reach the host in increasing order.
+static PLT_MUTEX streamResizeMutex;
+static bool streamResizeAvailable;
+static uint32_t lastSentStreamResizeId;
+static uint32_t lastDeliveredStreamResizeId;
 
 #define CONN_IMMEDIATE_POOR_LOSS_RATE 30
 #define CONN_CONSECUTIVE_POOR_LOSS_RATE 15
@@ -305,6 +313,7 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&streamResizeMutex);
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -356,6 +365,9 @@ int initializeControlStream(void) {
     decryptionCtx = PltCreateCryptoContext();
     hdrEnabled = false;
     memset(&hdrMetadata, 0, sizeof(hdrMetadata));
+    streamResizeAvailable = false;
+    lastSentStreamResizeId = 0;
+    lastDeliveredStreamResizeId = 0;
 
     return 0;
 }
@@ -381,6 +393,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&enetMutex);
+    PltDeleteMutex(&streamResizeMutex);
 }
 
 static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
@@ -1101,6 +1114,33 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
     }
 }
 
+static void handleStreamResizeResult(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    SS_STREAM_RESIZE_RESULT result;
+    bool deliver;
+
+    if (!ssStreamResizeReadResult(ctlHdr + 1, (size_t)packetLength - sizeof(*ctlHdr), &result)) {
+        Limelog("Dropping malformed stream resize result\n");
+        return;
+    }
+
+    PltLockMutex(&streamResizeMutex);
+    deliver = ssStreamResizeAcceptResult(result.requestId, lastSentStreamResizeId, &lastDeliveredStreamResizeId);
+    PltUnlockMutex(&streamResizeMutex);
+
+    if (!deliver) {
+        Limelog("Dropping stale stream resize result for request %u\n", (unsigned int)result.requestId);
+        return;
+    }
+
+    Limelog("Stream resize request %u finished with status %u: %ux%u at %u FPS\n",
+            (unsigned int)result.requestId, (unsigned int)result.status,
+            (unsigned int)result.width, (unsigned int)result.height, (unsigned int)result.fps);
+
+    // This is invoked directly rather than through the async callback queue, which drops
+    // entries when it is full. Losing a result would leave the client unaware of a resize.
+    ListenerCallbacks.streamResizeResult(result.requestId, result.width, result.height, result.fps, result.status);
+}
+
 static void controlReceiveThreadFunc(void* context) {
     int err;
 
@@ -1292,8 +1332,12 @@ static void controlReceiveThreadFunc(void* context) {
                 hdrEnabled = (enableByte != 0);
             }
 
+            // This fork-only message isn't in the packet type tables
+            if (ctlHdr->type == SS_STREAM_RESIZE_RESULT_PTYPE && IS_SUNSHINE()) {
+                handleStreamResizeResult(ctlHdr, packetLength);
+            }
             // Process client callbacks in a separate thread
-            if (needsAsyncCallback(ctlHdr->type)) {
+            else if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
@@ -1641,6 +1685,11 @@ static void requestIdrFrameFunc(void* context) {
 
 // Stops the control stream
 int stopControlStream(void) {
+    // Wait for a stream resize request that is being sent and refuse new ones
+    PltLockMutex(&streamResizeMutex);
+    streamResizeAvailable = false;
+    PltUnlockMutex(&streamResizeMutex);
+
     stopping = true;
     LbqSignalQueueShutdown(&referenceFrameControlQueue);
     LbqSignalQueueShutdown(&frameFecStatusQueue);
@@ -2069,6 +2118,10 @@ int startControlStream(void) {
         }
     }
 
+    PltLockMutex(&streamResizeMutex);
+    streamResizeAvailable = true;
+    PltUnlockMutex(&streamResizeMutex);
+
     return 0;
 }
 
@@ -2083,4 +2136,50 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
 
     *metadata = hdrMetadata;
     return true;
+}
+
+int LiRequestStreamResize(int width, int height, int fps, uint32_t* requestId) {
+    SS_STREAM_RESIZE_REQUEST request;
+    uint8_t payload[SS_STREAM_RESIZE_REQUEST_LENGTH];
+    int err;
+
+    if (!IS_SUNSHINE() || !(SunshineFeatureFlags & LI_FF_STREAM_RESIZE)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (!ssStreamResizeValuesValid(width, height, fps)) {
+        return -2;
+    }
+
+    PltLockMutex(&streamResizeMutex);
+
+    if (!streamResizeAvailable || lastSentStreamResizeId == UINT32_MAX) {
+        PltUnlockMutex(&streamResizeMutex);
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    // The ID is used up even if sending fails, because the host may still see the request
+    request.requestId = ++lastSentStreamResizeId;
+    request.width = (uint16_t)width;
+    request.height = (uint16_t)height;
+    request.fps = (uint16_t)fps;
+    ssStreamResizeWriteRequest(&request, payload);
+
+    if (sendMessageAndForget(SS_STREAM_RESIZE_REQUEST_PTYPE,
+                             sizeof(payload),
+                             payload,
+                             CTRL_CHANNEL_GENERIC,
+                             ENET_PACKET_FLAG_RELIABLE,
+                             false)) {
+        Limelog("Stream resize request %u sent: %dx%d at %d FPS\n", (unsigned int)request.requestId, width, height, fps);
+        *requestId = request.requestId;
+        err = 0;
+    }
+    else {
+        Limelog("Stream resize request %u failed: %d\n", (unsigned int)request.requestId, (int)LastSocketError());
+        err = -1;
+    }
+
+    PltUnlockMutex(&streamResizeMutex);
+    return err;
 }

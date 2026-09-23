@@ -483,6 +483,26 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// This callback is invoked when the host answers a LiRequestStreamResize() call. This is a
+// fork-only extension (see LI_FF_STREAM_RESIZE).
+//
+// requestId is the ID that LiRequestStreamResize() returned. width, height, and fps are what the
+// host is actually streaming after handling the request: the new values for LI_STREAM_RESIZE_OK,
+// otherwise the values that stayed in effect.
+//
+// Results arrive in request order. Malformed results, results for IDs that were never sent, and
+// results that are not newer than the last delivered one are dropped before this callback runs.
+//
+// This callback is invoked on the control stream receive thread, so it must not block. It may call
+// LiRequestStreamResize().
+#define LI_STREAM_RESIZE_OK                    0
+#define LI_STREAM_RESIZE_SUPERSEDED            1 // A newer request replaced this one before the host started it
+#define LI_STREAM_RESIZE_REJECTED_INVALID      2 // The request was malformed or out of range
+#define LI_STREAM_RESIZE_REJECTED_UNSUPPORTED  3 // The host can't resize the stream in its current configuration
+#define LI_STREAM_RESIZE_FAILED_ROLLED_BACK    4 // The resize failed and the host restored the previous stream
+#define LI_STREAM_RESIZE_FAILED_SESSION_ENDING 5 // The resize failed without recovery and the host is ending the session
+typedef void(*ConnListenerStreamResizeResult)(uint32_t requestId, uint16_t width, uint16_t height, uint16_t fps, uint8_t status);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -497,6 +517,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerStreamResizeResult streamResizeResult;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -1038,7 +1059,29 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_STREAM_RESIZE           0x40000000 // LiRequestStreamResize() supported (fork-only extension)
 uint32_t LiGetHostFeatureFlags(void);
+
+// Limits for LiRequestStreamResize(). Width and height must also be even.
+#define LI_STREAM_RESIZE_MIN_WIDTH  640
+#define LI_STREAM_RESIZE_MIN_HEIGHT 360
+#define LI_STREAM_RESIZE_MAX_WIDTH  7680
+#define LI_STREAM_RESIZE_MAX_HEIGHT 4320
+#define LI_STREAM_RESIZE_MIN_FPS    1
+#define LI_STREAM_RESIZE_MAX_FPS    1000
+
+// This function asks the host to switch the running video stream to width x height at fps without
+// reconnecting. This is a fork-only extension that needs the LI_FF_STREAM_RESIZE host feature flag.
+//
+// On success, this returns 0 and stores the new request ID in requestId. Request IDs start at 1 for
+// each connection and increase with every request. The host answers every request through the
+// streamResizeResult callback. The client should rebuild its decoder for the new size only after a
+// LI_STREAM_RESIZE_OK result, because frames of the new size may arrive before or after the result.
+//
+// This returns LI_ERR_UNSUPPORTED if the host doesn't support resizing or the stream isn't running,
+// -2 if the values are outside the LI_STREAM_RESIZE_* limits, and -1 if the request couldn't be sent.
+// It may be called from any thread.
+int LiRequestStreamResize(int width, int height, int fps, uint32_t* requestId);
 
 #ifdef __cplusplus
 }

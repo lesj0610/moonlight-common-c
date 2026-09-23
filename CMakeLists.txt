@@ -117,3 +117,21 @@ target_include_directories(moonlight-common-c SYSTEM PRIVATE
 )
 
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
+
+option(MOONLIGHT_COMMON_C_TESTS "Build the unit tests" OFF)
+if (MOONLIGHT_COMMON_C_TESTS)
+  enable_language(CXX)
+  enable_testing()
+
+  add_executable(stream-resize-test
+    tests/StreamResizeTest.c
+    tests/StreamResizeHeaderCxx.cpp
+  )
+  target_include_directories(stream-resize-test PRIVATE src)
+  if(MSVC)
+    target_compile_options(stream-resize-test PRIVATE /W3 /WX)
+  else()
+    target_compile_options(stream-resize-test PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME stream-resize-test COMMAND stream-resize-test)
+endif()
