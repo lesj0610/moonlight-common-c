@@ -11,11 +11,17 @@
 // Request, client to host, SS_STREAM_RESIZE_REQUEST_PTYPE, 10 bytes:
 //   uint32_t requestId, uint16_t width, uint16_t height, uint16_t fps
 //
-// Result, host to client, SS_STREAM_RESIZE_RESULT_PTYPE, 11 bytes:
-//   uint32_t requestId, uint16_t width, uint16_t height, uint16_t fps, uint8_t status
+// Result, host to client, SS_STREAM_RESIZE_RESULT_PTYPE, 16 bytes:
+//   uint32_t requestId, uint16_t width, uint16_t height, uint16_t fps, uint8_t status,
+//   uint8_t flags, uint32_t firstFrame
 //
 // The host answers every request it can read a request ID from with exactly one result, in request
 // order. width, height, and fps in a result are what the host streams after handling the request.
+// With SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME in flags, firstFrame is the frame number of the
+// first frame the host encoded at that mode for this answer. Other flag bits are not defined.
+//
+// This is version 2, advertised with LI_FF_STREAM_RESIZE. Version 1 answered in 11 bytes without
+// flags and firstFrame, used another feature flag, and was never released.
 
 #include "Limelight.h"
 
@@ -34,7 +40,9 @@ extern "C" {
 #define SS_STREAM_RESIZE_REQUEST_PTYPE  0x55F0
 #define SS_STREAM_RESIZE_REQUEST_LENGTH 10
 #define SS_STREAM_RESIZE_RESULT_PTYPE   0x55F1
-#define SS_STREAM_RESIZE_RESULT_LENGTH  11
+#define SS_STREAM_RESIZE_RESULT_LENGTH  16
+
+#define SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME 0x01
 
 typedef struct _SS_STREAM_RESIZE_REQUEST {
     uint32_t requestId;
@@ -49,6 +57,8 @@ typedef struct _SS_STREAM_RESIZE_RESULT {
     uint16_t height;
     uint16_t fps;
     uint8_t status;
+    bool hasFirstFrame;
+    uint32_t firstFrame;
 } SS_STREAM_RESIZE_RESULT, *PSS_STREAM_RESIZE_RESULT;
 
 // What the host does with a received request (see ssStreamResizeReadRequest())
@@ -135,12 +145,15 @@ SS_STREAM_RESIZE_INLINE void ssStreamResizeWriteResult(const SS_STREAM_RESIZE_RE
     ssStreamResizePut16(out + 6, result->height);
     ssStreamResizePut16(out + 8, result->fps);
     out[10] = result->status;
+    out[11] = result->hasFirstFrame ? SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME : 0;
+    ssStreamResizePut32(out + 12, result->hasFirstFrame ? result->firstFrame : 0);
 }
 
 // Returns false for a malformed result, which must be dropped: wrong length, request ID 0, an unknown
-// status, an OK result outside the LI_STREAM_RESIZE_* limits, or any other result with a zero value.
-// A failed result reports the size that stayed in effect, which may be the size the stream started
-// with and need not fit the resize limits.
+// status, undefined flag bits, a first frame without its flag, an OK result outside the
+// LI_STREAM_RESIZE_* limits, or any other result with a zero value. A failed result reports the size
+// that stayed in effect, which may be the size the stream started with and need not fit the resize
+// limits.
 SS_STREAM_RESIZE_INLINE bool ssStreamResizeReadResult(const void* data, size_t length, PSS_STREAM_RESIZE_RESULT result) {
     const uint8_t* in = (const uint8_t*)data;
 
@@ -153,8 +166,14 @@ SS_STREAM_RESIZE_INLINE bool ssStreamResizeReadResult(const void* data, size_t l
     result->height = ssStreamResizeGet16(in + 6);
     result->fps = ssStreamResizeGet16(in + 8);
     result->status = in[10];
+    result->hasFirstFrame = (in[11] & SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME) != 0;
+    result->firstFrame = ssStreamResizeGet32(in + 12);
 
     if (result->requestId == 0 || !ssStreamResizeStatusKnown(result->status)) {
+        return false;
+    }
+
+    if ((in[11] & ~SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME) != 0 || (!result->hasFirstFrame && result->firstFrame != 0)) {
         return false;
     }
 
@@ -163,6 +182,12 @@ SS_STREAM_RESIZE_INLINE bool ssStreamResizeReadResult(const void* data, size_t l
     }
 
     return result->width != 0 && result->height != 0 && result->fps != 0;
+}
+
+// Whether frame number frame is at or after frame number first, comparing them the way sequence
+// numbers are compared, so the answer holds across the frame number wrapping.
+SS_STREAM_RESIZE_INLINE bool ssStreamResizeFrameAtOrAfter(uint32_t frame, uint32_t first) {
+    return (int32_t)(frame - first) >= 0;
 }
 
 // Client-side ordering rule for well-formed results. lastSentId is the newest request ID sent on

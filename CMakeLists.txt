@@ -134,4 +134,29 @@ if (MOONLIGHT_COMMON_C_TESTS)
     target_compile_options(stream-resize-test PRIVATE -Wall -Wextra -Werror)
   endif()
   add_test(NAME stream-resize-test COMMAND stream-resize-test)
+
+  # The depacketizer with the real queue and platform code, and the rest of the library stood in
+  # for by the test
+  add_executable(video-hold-test
+    tests/VideoHoldTest.c
+    src/VideoDepacketizer.c
+    src/LinkedBlockingQueue.c
+    src/ByteBuffer.c
+    src/Platform.c
+  )
+  target_include_directories(video-hold-test PRIVATE src)
+  target_link_libraries(video-hold-test PRIVATE enet)
+  target_compile_definitions(video-hold-test PRIVATE HAS_SOCKLEN_T LC_DEBUG)
+  if(MSVC)
+    target_compile_options(video-hold-test PRIVATE /W3 /wd4100 /wd4232 /wd5105 /WX)
+    target_link_libraries(video-hold-test PRIVATE ws2_32.lib winmm.lib)
+  elseif(MINGW)
+    target_link_libraries(video-hold-test PRIVATE -lws2_32 -lwinmm)
+  else()
+    target_compile_options(video-hold-test PRIVATE -Wall -Wextra -Wno-unused-parameter -Werror)
+  endif()
+  if (USE_MBEDTLS)
+    target_compile_definitions(video-hold-test PRIVATE USE_MBEDTLS)
+  endif()
+  add_test(NAME video-hold-test COMMAND video-hold-test)
 endif()

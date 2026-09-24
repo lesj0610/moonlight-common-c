@@ -490,6 +490,11 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 // host is actually streaming after handling the request: the new values for LI_STREAM_RESIZE_OK,
 // otherwise the values that stayed in effect.
 //
+// hasFirstFrame is set when the host started encoding anew for this answer: at the new mode for
+// LI_STREAM_RESIZE_OK, or at the mode it went back to after a rollback. firstFrame is then the
+// frame number of the first frame of that encoding. Every frame from it on has the answer's mode,
+// and frames before it may not, however late they arrive. Pass it to LiResumeVideo().
+//
 // Results arrive in request order. Malformed results, results for IDs that were never sent, and
 // results that are not newer than the last delivered one are dropped before this callback runs.
 //
@@ -501,7 +506,16 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 #define LI_STREAM_RESIZE_REJECTED_UNSUPPORTED  3 // The host can't resize the stream in its current configuration
 #define LI_STREAM_RESIZE_FAILED_ROLLED_BACK    4 // The resize failed and the host restored the previous stream
 #define LI_STREAM_RESIZE_FAILED_SESSION_ENDING 5 // The resize failed without recovery and the host is ending the session
-typedef void(*ConnListenerStreamResizeResult)(uint32_t requestId, uint16_t width, uint16_t height, uint16_t fps, uint8_t status);
+typedef struct _STREAM_RESIZE_RESULT {
+    uint32_t requestId;
+    uint16_t width;
+    uint16_t height;
+    uint16_t fps;
+    uint8_t status;
+    bool hasFirstFrame;
+    uint32_t firstFrame;
+} STREAM_RESIZE_RESULT, *PSTREAM_RESIZE_RESULT;
+typedef void(*ConnListenerStreamResizeResult)(const STREAM_RESIZE_RESULT* result);
 
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
@@ -1059,7 +1073,9 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
-#define LI_FF_STREAM_RESIZE           0x40000000 // LiRequestStreamResize() supported (fork-only extension)
+// LiRequestStreamResize() supported (fork-only extension). An earlier, unreleased version used
+// 0x40000000 and answered without the first frame of the new mode; this library ignores it.
+#define LI_FF_STREAM_RESIZE           0x20000000
 uint32_t LiGetHostFeatureFlags(void);
 
 // Limits for LiRequestStreamResize(). Width and height must also be even.
@@ -1075,8 +1091,9 @@ uint32_t LiGetHostFeatureFlags(void);
 //
 // On success, this returns 0 and stores the new request ID in requestId. Request IDs start at 1 for
 // each connection and increase with every request. The host answers every request through the
-// streamResizeResult callback. The client should rebuild its decoder for the new size only after a
-// LI_STREAM_RESIZE_OK result, because frames of the new size may arrive before or after the result.
+// streamResizeResult callback. Frames of the new size can arrive before the answer does, so a
+// client should call LiHoldVideo() before sending the request, rebuild its decoder once the answer
+// says what the stream is, and then call LiResumeVideo() with the answer's first frame.
 //
 // This returns LI_ERR_UNSUPPORTED if the host doesn't support resizing or the stream isn't running,
 // -2 if the values are outside the LI_STREAM_RESIZE_* limits, and -1 if the request couldn't be
@@ -1084,6 +1101,29 @@ uint32_t LiGetHostFeatureFlags(void);
 // request that was queued for sending counts as sent, because it is delivered once the network
 // recovers or the connection ends. It may be called from any thread.
 int LiRequestStreamResize(int width, int height, int fps, uint32_t* requestId);
+
+// A host answers every stream resize request within this long after receiving it, or ends the
+// session. That covers a resize that fails and is rolled back with every step taking as long as
+// the host lets it, so a slow answer is not a missing one. A client that has had no answer after
+// this plus the time the answer takes to travel can treat the host as gone.
+#define LI_STREAM_RESIZE_ANSWER_WITHIN_MS 120000
+
+// These functions hold video back while the stream changes size (fork-only extension).
+//
+// While video is held, decode units are dropped here before any decoder sees them, whichever way
+// the decoder takes them: pushed to submitDecodeUnit(), pulled with LiWaitForNextVideoFrame(),
+// LiPollNextVideoFrame() or LiPeekNextVideoFrame(), or submitted directly. Dropped units are freed
+// here, so the client never gets or completes them.
+//
+// LiResumeVideo() lets units through again from the first keyframe at or after firstFrame, or from
+// the next keyframe when fromFrame is false. Frame numbers are compared the way sequence numbers
+// are, so this holds across the frame number wrapping. Only call these while the stream runs.
+void LiHoldVideo(void);
+void LiResumeVideo(bool fromFrame, uint32_t firstFrame);
+
+// This function returns whether decode units reach the decoder: false while video is held, and
+// after LiResumeVideo() until the keyframe it waits for has been let through.
+bool LiIsVideoFlowing(void);
 
 #ifdef __cplusplus
 }

@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "StreamResize.h"
 
 // Uncomment to test 3 byte Annex B start sequences with GFE
 //#define FORCE_3_BYTE_START_SEQUENCES
@@ -24,6 +25,18 @@ static uint64_t firstPacketPresentationTime;
 static uint32_t firstPacketRtpTimestamp;
 static bool dropStatePending;
 static bool idrFrameProcessed;
+
+// Video held back while the stream changes size (fork-only extension, see LiHoldVideo()). The
+// mutex guards the state below it, which the client changes from its own thread.
+#define VIDEO_FLOWING           0
+#define VIDEO_HELD              1
+#define VIDEO_AWAITING_KEYFRAME 2
+static PLT_MUTEX videoHoldMutex;
+static bool videoHoldReady;
+static int videoHoldState;
+static bool videoHoldFromFrame;
+static uint32_t videoHoldFirstFrame;
+static unsigned int videoHoldDropped;
 
 #define DR_CLEANUP -1000
 
@@ -78,6 +91,13 @@ void initializeVideoDepacketizer(int pktSize) {
     dropStatePending = false;
     idrFrameProcessed = false;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
+
+    PltCreateMutex(&videoHoldMutex);
+    videoHoldState = VIDEO_FLOWING;
+    videoHoldFromFrame = false;
+    videoHoldFirstFrame = 0;
+    videoHoldDropped = 0;
+    videoHoldReady = true;
 }
 
 // Free the NAL chain
@@ -153,6 +173,107 @@ void stopVideoDepacketizer(void) {
 void destroyVideoDepacketizer(void) {
     freeDecodeUnitList(LbqDestroyLinkedBlockingQueue(&decodeUnitQueue));
     cleanupFrameState();
+
+    videoHoldReady = false;
+    PltDeleteMutex(&videoHoldMutex);
+}
+
+// Free a decode unit and its buffers without the side effects of completing it
+static void freeQueuedDecodeUnit(PQUEUED_DECODE_UNIT qdu) {
+    PLENTRY_INTERNAL lastEntry;
+
+    while (qdu->decodeUnit.bufferList != NULL) {
+        lastEntry = (PLENTRY_INTERNAL)qdu->decodeUnit.bufferList;
+        qdu->decodeUnit.bufferList = lastEntry->entry.next;
+        free(lastEntry->allocPtr);
+    }
+
+    // We will have stack-allocated entries iff we have a direct-submit decoder
+    if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
+        free(qdu);
+    }
+}
+
+// Whether video being held back lets this decode unit through to the decoder. Every way a
+// decoder takes decode units asks this, so none of them can go around it. With letThrough set,
+// the awaited keyframe passing lets everything after it through too. Called with
+// videoHoldMutex held.
+static bool videoHoldAdmitsLocked(PDECODE_UNIT decodeUnit, bool letThrough) {
+    bool admit;
+
+    switch (videoHoldState) {
+    case VIDEO_FLOWING:
+        admit = true;
+        break;
+    case VIDEO_AWAITING_KEYFRAME:
+        // A keyframe from before the stream changed mode can still be on its way, and it has the
+        // old size. Only one from the frame the host named on is the new stream.
+        admit = decodeUnit->frameType == FRAME_TYPE_IDR &&
+                (!videoHoldFromFrame || ssStreamResizeFrameAtOrAfter((uint32_t)decodeUnit->frameNumber, videoHoldFirstFrame));
+        if (admit && letThrough) {
+            Limelog("Video resumed at frame %u after dropping %u frames\n",
+                    (unsigned int)decodeUnit->frameNumber, videoHoldDropped);
+            videoHoldState = VIDEO_FLOWING;
+        }
+        break;
+    default:
+        admit = false;
+        break;
+    }
+    if (!admit && letThrough) {
+        videoHoldDropped++;
+    }
+
+    return admit;
+}
+
+static bool videoHoldAdmits(PDECODE_UNIT decodeUnit, bool letThrough) {
+    bool admit;
+
+    PltLockMutex(&videoHoldMutex);
+    admit = videoHoldAdmitsLocked(decodeUnit, letThrough);
+    PltUnlockMutex(&videoHoldMutex);
+
+    return admit;
+}
+
+void LiHoldVideo(void) {
+    if (!videoHoldReady) {
+        return;
+    }
+
+    PltLockMutex(&videoHoldMutex);
+    if (videoHoldState != VIDEO_HELD) {
+        videoHoldDropped = 0;
+    }
+    videoHoldState = VIDEO_HELD;
+    PltUnlockMutex(&videoHoldMutex);
+}
+
+void LiResumeVideo(bool fromFrame, uint32_t firstFrame) {
+    if (!videoHoldReady) {
+        return;
+    }
+
+    PltLockMutex(&videoHoldMutex);
+    videoHoldState = VIDEO_AWAITING_KEYFRAME;
+    videoHoldFromFrame = fromFrame;
+    videoHoldFirstFrame = fromFrame ? firstFrame : 0;
+    PltUnlockMutex(&videoHoldMutex);
+}
+
+bool LiIsVideoFlowing(void) {
+    bool flowing;
+
+    if (!videoHoldReady) {
+        return true;
+    }
+
+    PltLockMutex(&videoHoldMutex);
+    flowing = videoHoldState == VIDEO_FLOWING;
+    PltUnlockMutex(&videoHoldMutex);
+
+    return flowing;
 }
 
 // NB: This function also ensures an additional byte for the NALU type exists after the start sequence
@@ -237,9 +358,18 @@ void validateDecodeUnitForPlayback(PDECODE_UNIT decodeUnit) {
 bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
     PQUEUED_DECODE_UNIT qdu;
 
-    int err = LbqWaitForQueueElement(&decodeUnitQueue, (void**)&qdu);
-    if (err != LBQ_SUCCESS) {
-        return false;
+    for (;;) {
+        int err = LbqWaitForQueueElement(&decodeUnitQueue, (void**)&qdu);
+        if (err != LBQ_SUCCESS) {
+            return false;
+        }
+
+        if (videoHoldAdmits(&qdu->decodeUnit, true)) {
+            break;
+        }
+
+        // Held back while the stream changes size
+        freeQueuedDecodeUnit(qdu);
     }
 
     validateDecodeUnitForPlayback(&qdu->decodeUnit);
@@ -252,9 +382,18 @@ bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* deco
 bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
     PQUEUED_DECODE_UNIT qdu;
 
-    int err = LbqPollQueueElement(&decodeUnitQueue, (void**)&qdu);
-    if (err != LBQ_SUCCESS) {
-        return false;
+    for (;;) {
+        int err = LbqPollQueueElement(&decodeUnitQueue, (void**)&qdu);
+        if (err != LBQ_SUCCESS) {
+            return false;
+        }
+
+        if (videoHoldAdmits(&qdu->decodeUnit, true)) {
+            break;
+        }
+
+        // Held back while the stream changes size
+        freeQueuedDecodeUnit(qdu);
     }
 
     validateDecodeUnitForPlayback(&qdu->decodeUnit);
@@ -267,9 +406,31 @@ bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeU
 bool LiPeekNextVideoFrame(PDECODE_UNIT* decodeUnit) {
     PQUEUED_DECODE_UNIT qdu;
 
-    int err = LbqPeekQueueElement(&decodeUnitQueue, (void**)&qdu);
-    if (err != LBQ_SUCCESS) {
-        return false;
+    for (;;) {
+        PQUEUED_DECODE_UNIT held = NULL;
+        bool admit;
+
+        int err = LbqPeekQueueElement(&decodeUnitQueue, (void**)&qdu);
+        if (err != LBQ_SUCCESS) {
+            return false;
+        }
+
+        // A unit held back while the stream changes size is dropped here, so the peek shows
+        // what the decoder will actually get next. It is taken off the queue under the same
+        // lock it was judged under, so video resuming in between cannot lose a keyframe.
+        PltLockMutex(&videoHoldMutex);
+        admit = videoHoldAdmitsLocked(&qdu->decodeUnit, false);
+        if (!admit && LbqPollQueueElement(&decodeUnitQueue, (void**)&held) == LBQ_SUCCESS) {
+            videoHoldDropped++;
+        }
+        PltUnlockMutex(&videoHoldMutex);
+
+        if (admit) {
+            break;
+        }
+        if (held != NULL) {
+            freeQueuedDecodeUnit(held);
+        }
     }
 
     validateDecodeUnitForPlayback(&qdu->decodeUnit);
@@ -285,7 +446,6 @@ void LiWakeWaitForVideoFrame(void) {
 // Cleanup a decode unit by freeing the buffer chain and the holder
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
     PQUEUED_DECODE_UNIT qdu = handle;
-    PLENTRY_INTERNAL lastEntry;
 
     if (drStatus == DR_NEED_IDR) {
         Limelog("Requesting IDR frame on behalf of DR\n");
@@ -297,16 +457,7 @@ void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
         idrFrameProcessed = true;
     }
 
-    while (qdu->decodeUnit.bufferList != NULL) {
-        lastEntry = (PLENTRY_INTERNAL)qdu->decodeUnit.bufferList;
-        qdu->decodeUnit.bufferList = lastEntry->entry.next;
-        free(lastEntry->allocPtr);
-    }
-
-    // We will have stack-allocated entries iff we have a direct-submit decoder
-    if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        free(qdu);
-    }
+    freeQueuedDecodeUnit(qdu);
 }
 
 static bool isSeqReferenceFrameStart(PBUFFER_DESC buffer) {
@@ -533,10 +684,14 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                     return;
                 }
             }
-            else {
+            else if (videoHoldAdmits(&qdu->decodeUnit, true)) {
                 // Submit the frame to the decoder
                 validateDecodeUnitForPlayback(&qdu->decodeUnit);
                 LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
+            }
+            else {
+                // Held back while the stream changes size
+                freeQueuedDecodeUnit(qdu);
             }
 
             // Notify the control connection

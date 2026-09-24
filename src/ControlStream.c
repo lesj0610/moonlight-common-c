@@ -1145,13 +1145,31 @@ static void handleStreamResizeResult(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int pa
         return;
     }
 
-    Limelog("Stream resize request %u finished with status %u: %ux%u at %u FPS\n",
-            (unsigned int)result.requestId, (unsigned int)result.status,
-            (unsigned int)result.width, (unsigned int)result.height, (unsigned int)result.fps);
+    if (result.hasFirstFrame) {
+        Limelog("Stream resize request %u finished with status %u: %ux%u at %u FPS from frame %u\n",
+                (unsigned int)result.requestId, (unsigned int)result.status,
+                (unsigned int)result.width, (unsigned int)result.height, (unsigned int)result.fps,
+                (unsigned int)result.firstFrame);
+    }
+    else {
+        Limelog("Stream resize request %u finished with status %u: %ux%u at %u FPS\n",
+                (unsigned int)result.requestId, (unsigned int)result.status,
+                (unsigned int)result.width, (unsigned int)result.height, (unsigned int)result.fps);
+    }
+
+    STREAM_RESIZE_RESULT answer = {
+        .requestId = result.requestId,
+        .width = result.width,
+        .height = result.height,
+        .fps = result.fps,
+        .status = result.status,
+        .hasFirstFrame = result.hasFirstFrame,
+        .firstFrame = result.firstFrame,
+    };
 
     // This is invoked directly rather than through the async callback queue, which drops
     // entries when it is full. Losing a result would leave the client unaware of a resize.
-    ListenerCallbacks.streamResizeResult(result.requestId, result.width, result.height, result.fps, result.status);
+    ListenerCallbacks.streamResizeResult(&answer);
 }
 
 static void controlReceiveThreadFunc(void* context) {

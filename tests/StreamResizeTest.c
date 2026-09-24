@@ -23,7 +23,7 @@ static void writeRequestBytes(uint8_t out[SS_STREAM_RESIZE_REQUEST_LENGTH], uint
 }
 
 static void writeResultBytes(uint8_t out[SS_STREAM_RESIZE_RESULT_LENGTH], uint32_t requestId, uint16_t width, uint16_t height, uint16_t fps, uint8_t status) {
-    SS_STREAM_RESIZE_RESULT result = { requestId, width, height, fps, status };
+    SS_STREAM_RESIZE_RESULT result = { requestId, width, height, fps, status, false, 0 };
     ssStreamResizeWriteResult(&result, out);
 }
 
@@ -44,8 +44,13 @@ static void testProtocolConstants(void) {
     CHECK(SS_STREAM_RESIZE_REQUEST_PTYPE == 0x55F0);
     CHECK(SS_STREAM_RESIZE_RESULT_PTYPE == 0x55F1);
     CHECK(SS_STREAM_RESIZE_REQUEST_LENGTH == 10);
-    CHECK(SS_STREAM_RESIZE_RESULT_LENGTH == 11);
-    CHECK(LI_FF_STREAM_RESIZE == 0x40000000);
+    CHECK(SS_STREAM_RESIZE_RESULT_LENGTH == 16);
+    CHECK(SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME == 0x01);
+
+    // A host with the unreleased first version advertised 0x40000000 and answered without the first
+    // frame, so this version must not be mistaken for it
+    CHECK(LI_FF_STREAM_RESIZE == 0x20000000);
+    CHECK((LI_FF_STREAM_RESIZE & 0x40000000) == 0);
     CHECK((LI_FF_STREAM_RESIZE & (LI_FF_PEN_TOUCH_EVENTS | LI_FF_CONTROLLER_TOUCH_EVENTS)) == 0);
 
     CHECK(LI_STREAM_RESIZE_OK == 0);
@@ -90,19 +95,49 @@ static void testResultWireLayout(void) {
         0xA0, 0x05,             // height 1440
         0xE8, 0x03,             // fps 1000
         0x04,                   // status FAILED_ROLLED_BACK
+        0x01,                   // flags HAS_FIRST_FRAME
+        0x44, 0x33, 0x22, 0x11, // firstFrame 0x11223344
     };
+    static const uint8_t expectedWithout[SS_STREAM_RESIZE_RESULT_LENGTH] = {
+        0x07, 0x00, 0x00, 0x00, // requestId 7
+        0x80, 0x07,             // width 1920
+        0x38, 0x04,             // height 1080
+        0x3C, 0x00,             // fps 60
+        0x03,                   // status REJECTED_UNSUPPORTED
+        0x00,                   // no flags
+        0x00, 0x00, 0x00, 0x00, // no firstFrame
+    };
+    SS_STREAM_RESIZE_RESULT result = { 0xAABBCCDD, 2560, 1440, 1000, LI_STREAM_RESIZE_FAILED_ROLLED_BACK, true, 0x11223344 };
     uint8_t wire[SS_STREAM_RESIZE_RESULT_LENGTH];
-    SS_STREAM_RESIZE_RESULT result;
 
-    writeResultBytes(wire, 0xAABBCCDD, 2560, 1440, 1000, LI_STREAM_RESIZE_FAILED_ROLLED_BACK);
+    ssStreamResizeWriteResult(&result, wire);
     CHECK(memcmp(wire, expected, sizeof(expected)) == 0);
 
+    memset(&result, 0, sizeof(result));
     CHECK(ssStreamResizeReadResult(expected, sizeof(expected), &result));
     CHECK(result.requestId == 0xAABBCCDD);
     CHECK(result.width == 2560);
     CHECK(result.height == 1440);
     CHECK(result.fps == 1000);
     CHECK(result.status == LI_STREAM_RESIZE_FAILED_ROLLED_BACK);
+    CHECK(result.hasFirstFrame);
+    CHECK(result.firstFrame == 0x11223344);
+
+    // Without the flag, whatever firstFrame holds is not written
+    result = (SS_STREAM_RESIZE_RESULT){ 7, 1920, 1080, 60, LI_STREAM_RESIZE_REJECTED_UNSUPPORTED, false, 99 };
+    ssStreamResizeWriteResult(&result, wire);
+    CHECK(memcmp(wire, expectedWithout, sizeof(expectedWithout)) == 0);
+    CHECK(ssStreamResizeReadResult(wire, sizeof(wire), &result));
+    CHECK(!result.hasFirstFrame);
+    CHECK(result.firstFrame == 0);
+
+    // Frame 0 is a real frame number once frame numbers wrap
+    result = (SS_STREAM_RESIZE_RESULT){ 8, 1920, 1080, 60, LI_STREAM_RESIZE_OK, true, 0 };
+    ssStreamResizeWriteResult(&result, wire);
+    memset(&result, 0, sizeof(result));
+    CHECK(ssStreamResizeReadResult(wire, sizeof(wire), &result));
+    CHECK(result.hasFirstFrame);
+    CHECK(result.firstFrame == 0);
 }
 
 static void testValueLimits(void) {
@@ -173,6 +208,24 @@ static void testMalformedResults(void) {
     CHECK(!readResult(0, 1920, 1080, 60, LI_STREAM_RESIZE_OK));
     CHECK(!readResult(3, 1920, 1080, 60, 6));
     CHECK(!readResult(3, 1920, 1080, 60, 0xFF));
+
+    // The unreleased first version answered in 11 bytes
+    CHECK(!ssStreamResizeReadResult(wire, 11, &result));
+
+    // Flags other than HAS_FIRST_FRAME are not defined, and a first frame needs its flag
+    for (int bit = 1; bit < 8; bit++) {
+        writeResultBytes(wire, 3, 1920, 1080, 60, LI_STREAM_RESIZE_OK);
+        wire[11] = (uint8_t)(1 << bit);
+        CHECK(!ssStreamResizeReadResult(wire, SS_STREAM_RESIZE_RESULT_LENGTH, &result));
+        wire[11] |= SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME;
+        CHECK(!ssStreamResizeReadResult(wire, SS_STREAM_RESIZE_RESULT_LENGTH, &result));
+    }
+    writeResultBytes(wire, 3, 1920, 1080, 60, LI_STREAM_RESIZE_OK);
+    wire[12] = 1;
+    CHECK(!ssStreamResizeReadResult(wire, SS_STREAM_RESIZE_RESULT_LENGTH, &result));
+    wire[11] = SS_STREAM_RESIZE_RESULT_HAS_FIRST_FRAME;
+    CHECK(ssStreamResizeReadResult(wire, SS_STREAM_RESIZE_RESULT_LENGTH, &result));
+    CHECK(result.hasFirstFrame && result.firstFrame == 1);
 
     for (uint8_t status = LI_STREAM_RESIZE_OK; status <= LI_STREAM_RESIZE_FAILED_SESSION_ENDING; status++) {
         CHECK(readResult(3, 1920, 1080, 60, status));
