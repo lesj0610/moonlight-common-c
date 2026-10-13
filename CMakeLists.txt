@@ -135,6 +135,15 @@ if (MOONLIGHT_COMMON_C_TESTS)
   endif()
   add_test(NAME stream-resize-test COMMAND stream-resize-test)
 
+  add_executable(local-cursor-test tests/LocalCursorTest.c)
+  target_include_directories(local-cursor-test PRIVATE src)
+  if(MSVC)
+    target_compile_options(local-cursor-test PRIVATE /W3 /WX)
+  else()
+    target_compile_options(local-cursor-test PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME local-cursor-test COMMAND local-cursor-test)
+
   # The depacketizer with the real queue and platform code, and the rest of the library stood in
   # for by the test
   add_executable(video-hold-test

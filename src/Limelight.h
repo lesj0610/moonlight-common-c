@@ -517,6 +517,27 @@ typedef struct _STREAM_RESIZE_RESULT {
 } STREAM_RESIZE_RESULT, *PSTREAM_RESIZE_RESULT;
 typedef void(*ConnListenerStreamResizeResult)(const STREAM_RESIZE_RESULT* result);
 
+// This callback is invoked when the host's mouse pointer changes, after LiSetLocalCursor() asked
+// the host to leave drawing it to the client. This is a fork-only extension (see LI_FF_LOCAL_CURSOR).
+//
+// visible says whether the pointer is shown. image is NULL when only that changed. Otherwise it holds
+// width * height pixels of 32-bit BGRA with straight alpha (B, G, R, A in memory), row by row from the
+// top, with the hot spot at hotX, hotY. The host shrank the image by scale to send it, so drawing it
+// scale times larger matches the host's pointer size.
+//
+// This callback is invoked on the control stream receive thread, so it must not block. image is only
+// valid during the call.
+typedef struct _LOCAL_CURSOR_UPDATE {
+    bool visible;
+    const uint8_t* image;
+    int width;
+    int height;
+    int hotX;
+    int hotY;
+    int scale;
+} LOCAL_CURSOR_UPDATE, *PLOCAL_CURSOR_UPDATE;
+typedef void(*ConnListenerLocalCursorUpdate)(const LOCAL_CURSOR_UPDATE* update);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -532,6 +553,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
     ConnListenerStreamResizeResult streamResizeResult;
+    ConnListenerLocalCursorUpdate localCursorUpdate;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -1081,6 +1103,7 @@ void LiRequestIdrFrame(void);
 // LiRequestStreamResize() supported (fork-only extension). An earlier, unreleased version used
 // 0x40000000 and answered without the first frame of the new mode; this library ignores it.
 #define LI_FF_STREAM_RESIZE           0x20000000
+#define LI_FF_LOCAL_CURSOR            0x10000000 // LiSetLocalCursor() supported (fork-only extension)
 uint32_t LiGetHostFeatureFlags(void);
 
 // Limits for LiRequestStreamResize(). Width and height must also be even.
@@ -1106,6 +1129,17 @@ uint32_t LiGetHostFeatureFlags(void);
 // request that was queued for sending counts as sent, because it is delivered once the network
 // recovers or the connection ends. It may be called from any thread.
 int LiRequestStreamResize(int width, int height, int fps, uint32_t* requestId);
+
+// This function asks the host to stop drawing the mouse pointer into the video and to report it
+// through the localCursorUpdate callback instead (enabled), or to go back to drawing it (disabled).
+// This is a fork-only extension that needs the LI_FF_LOCAL_CURSOR host feature flag.
+//
+// It is meant for absolute mouse input: drawn at the client's own mouse position, the reported pointer
+// moves without waiting for video. The host reports the current pointer once it is enabled.
+//
+// This returns 0 on success, LI_ERR_UNSUPPORTED if the host doesn't support it or the stream isn't
+// running, and -1 if the request couldn't be sent. It may be called from any thread.
+int LiSetLocalCursor(bool enabled);
 
 // A host answers every stream resize request within this long after receiving it, or ends the
 // session. That covers a resize that fails and is rolled back with every step taking as long as

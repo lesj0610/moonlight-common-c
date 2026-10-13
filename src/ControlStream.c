@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "LocalCursor.h"
 #include "StreamResize.h"
 
 // This is a private header, but it just contains some time macros
@@ -1127,6 +1128,19 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
     }
 }
 
+static void handleLocalCursorUpdate(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    LOCAL_CURSOR_UPDATE update;
+
+    if (!ssLocalCursorReadUpdate(ctlHdr + 1, (size_t)packetLength - sizeof(*ctlHdr), &update)) {
+        Limelog("Dropping malformed local cursor update\n");
+        return;
+    }
+
+    // This is invoked directly rather than through the async callback queue, which drops entries
+    // when it is full and would have to copy the image
+    ListenerCallbacks.localCursorUpdate(&update);
+}
+
 static void handleStreamResizeResult(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
     SS_STREAM_RESIZE_RESULT result;
     bool deliver;
@@ -1363,9 +1377,12 @@ static void controlReceiveThreadFunc(void* context) {
                 hdrEnabled = (enableByte != 0);
             }
 
-            // This fork-only message isn't in the packet type tables
+            // These fork-only messages aren't in the packet type tables
             if (ctlHdr->type == SS_STREAM_RESIZE_RESULT_PTYPE && IS_SUNSHINE()) {
                 handleStreamResizeResult(ctlHdr, packetLength);
+            }
+            else if (ctlHdr->type == SS_LOCAL_CURSOR_UPDATE_PTYPE && IS_SUNSHINE()) {
+                handleLocalCursorUpdate(ctlHdr, packetLength);
             }
             // Process client callbacks in a separate thread
             else if (needsAsyncCallback(ctlHdr->type)) {
@@ -2214,6 +2231,38 @@ int LiRequestStreamResize(int width, int height, int fps, uint32_t* requestId) {
     else {
         Limelog("Stream resize request %u could not be sent: %d\n", (unsigned int)request.requestId, (int)LastSocketError());
         lastSentStreamResizeId--;
+        err = -1;
+    }
+
+    PltUnlockMutex(&streamResizeMutex);
+    return err;
+}
+
+int LiSetLocalCursor(bool enabled) {
+    uint8_t payload[SS_LOCAL_CURSOR_REQUEST_LENGTH] = { enabled ? 1 : 0 };
+    int err;
+
+    if (!IS_SUNSHINE() || !(SunshineFeatureFlags & LI_FF_LOCAL_CURSOR)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    // The stream resize lock and flag also keep this from sending once the control stream stops
+    PltLockMutex(&streamResizeMutex);
+
+    if (!streamResizeAvailable) {
+        err = LI_ERR_UNSUPPORTED;
+    }
+    else if (sendMessageAndForget(SS_LOCAL_CURSOR_REQUEST_PTYPE,
+                                  sizeof(payload),
+                                  payload,
+                                  CTRL_CHANNEL_GENERIC,
+                                  ENET_PACKET_FLAG_RELIABLE,
+                                  false)) {
+        Limelog("Local cursor %s\n", enabled ? "enabled" : "disabled");
+        err = 0;
+    }
+    else {
+        Limelog("Local cursor request could not be sent: %d\n", (int)LastSocketError());
         err = -1;
     }
 

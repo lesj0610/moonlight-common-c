@@ -41,6 +41,7 @@ static void fakeClRumbleTriggers(uint16_t controllerNumber, uint16_t leftTrigger
 static void fakeClSetMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz) {}
 static void fakeClSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {};
 static void fakeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b) {}
+static void fakeClLocalCursorUpdate(const LOCAL_CURSOR_UPDATE* update) {}
 static void fakeClStreamResizeResult(const STREAM_RESIZE_RESULT* result) {}
 
 static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
@@ -58,6 +59,7 @@ static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .setControllerLED = fakeClSetControllerLED,
     .setAdaptiveTriggers = fakeClSetAdaptiveTriggers,
     .streamResizeResult = fakeClStreamResizeResult,
+    .localCursorUpdate = fakeClLocalCursorUpdate,
 };
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
@@ -150,6 +152,9 @@ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_REND
         }
         if ((*clCallbacks)->streamResizeResult == NULL) {
             (*clCallbacks)->streamResizeResult = fakeClStreamResizeResult;
+        }
+        if ((*clCallbacks)->localCursorUpdate == NULL) {
+            (*clCallbacks)->localCursorUpdate = fakeClLocalCursorUpdate;
         }
     }
 }
